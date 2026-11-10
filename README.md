@@ -1,7 +1,7 @@
 # DAT160 search & rescue
 
 Vår løsning på multi robot search & rescue-konkurransen (ROS 2 Foxy + Gazebo 11).
-Alt vi har skrevet ligger i `src/multi_robot_challenge_23`. Rapporten er `competition_report.pdf`.
+Alt vi har skrevet ligger i `src/multi_robot_challenge_23`. 
 
 Filer:
 - `robot_handler.py` - styrer én robot (følger veggen, snurrer rundt for å se etter markører, kjører til den store brannen)
