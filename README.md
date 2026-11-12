@@ -27,8 +27,3 @@ tb3_0 følger høyre vegg og tb3_1 venstre vegg. I world 1 starter robotene mots
 ```
 ros2 launch multi_robot_challenge_23 rescue_nodes.launch.py tb3_0_side:=left tb3_1_side:=right
 ```
-
-## Andre ting vi har endret
-
-- Byttet ut `worlds/*.world` med de fra `multi_robot_scoring/worlds` (scoring-noden trenger gazebo_ros_state-pluginen)
-- `aruco_node.py` bruker det gamle OpenCV ArUco-API-et hvis det nye ikke finnes, fordi den krasjet på Ubuntu 20.04 (OpenCV 4.2)
