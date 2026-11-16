@@ -22,6 +22,8 @@ SPIN_SPEED  = 0.8    # rad/s, not too fast so the marker pose is still accurate
 
 LOOP_TIME   = 30.0   # back at a place we were this long ago -> we are driving in a loop
 LOOP_DIST   = 0.5    # how close counts as "the same place"
+CELL        = 1.0    # size of the squares we use to remember where we have been
+NO_NEW_TIME = 45.0   # no new square (for either robot) in this long -> go somewhere new
 
 FIRE_STOP   = 1.2    # stop this close to the big fire (scoring needs < 2 m)
 FIRE_SEE    = 4.0    # only drive straight to the fire if it is closer than this (> marker range)
@@ -41,6 +43,9 @@ class RobotHandler(Node):
         self.pub = self.create_publisher(Twist, '/' + ns + '/cmd_vel', 10)
         self.create_subscription(LaserScan, '/' + ns + '/scan', self.scan_cb, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/' + ns + '/odom', self.odom_cb, 10)
+        # The other robot's odometry, so we know where it has been and can go somewhere else
+        other = 'tb3_1' if ns == 'tb3_0' else 'tb3_0'
+        self.create_subscription(Odometry, '/' + other + '/odom', self.other_odom_cb, 10)
         # Sent by the leader node to all robots
         self.create_subscription(Point, '/big_fire', self.fire_cb, 10)
         self.create_subscription(Bool, '/fire_done', self.fire_done_cb, 10)
@@ -57,6 +62,11 @@ class RobotHandler(Node):
         self.spun = 0.0           # how much we have turned in the current spin
         self.last_yaw = 0.0
         self.history = []         # (time, x, y) saved every 2 seconds, used to detect loops
+        self.visited = set()      # 1x1 m squares where one of the robots has been
+        self.last_new = self.now()  # when we last came into a square nobody had visited
+        self.escape_yaw = 0.0     # direction to drive in after a loop
+        self.end_turned = 0.0     # how much we have turned while going round a wall end
+        self.end_last_yaw = 0.0
         self.get_logger().info(f'Started {ns}, following the {side} wall')
 
     # ---------- callbacks ----------
@@ -68,6 +78,9 @@ class RobotHandler(Node):
         self.y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
         self.yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+
+    def other_odom_cb(self, msg):
+        self.visited.add(self.cell(msg.pose.pose.position.x, msg.pose.pose.position.y))
 
     def fire_cb(self, msg):
         if self.fire is None:
@@ -124,7 +137,15 @@ class RobotHandler(Node):
 
         if self.state == 'WALL_END' and wall > WALL_LOST:
             # Going round the end of a wall: keep turning towards it until it shows up again
-            if front < FRONT_STOP:
+            d = self.yaw - self.end_last_yaw
+            self.end_turned += abs(math.atan2(math.sin(d), math.cos(d)))
+            self.end_last_yaw = self.yaw
+            if self.end_turned > 1.5 * math.pi:
+                # Turned 270 degrees without finding the wall again (it was a small object),
+                # so drive straight instead of going round in circles
+                self.state = 'FIND'
+                cmd.linear.x = SPEED
+            elif front < FRONT_STOP:
                 cmd.angular.z = -self.dir * TURN_SPEED
             else:
                 cmd.linear.x = SPEED
@@ -132,15 +153,17 @@ class RobotHandler(Node):
         elif front < FRONT_STOP or (self.state == 'TURN' and front < FRONT_STOP + TURN_MARGIN):
             self.state = 'TURN'                 # wall ahead: turn away from the wall on the spot
             cmd.angular.z = self.dir * TURN_SPEED
+        elif self.state == 'FIND':
+            cmd.linear.x = SPEED                # drive straight until there is a wall in front
         elif wall < WALL_LOST:
             self.state = 'FOLLOW'               # keep WALL_DIST to the wall
             cmd.linear.x = SPEED
             turn = self.dir * KP * (WALL_DIST - wall)
             cmd.angular.z = max(-TURN_SPEED, min(TURN_SPEED, turn))
-        elif self.state == 'FIND':
-            cmd.linear.x = SPEED                # no wall found yet: drive straight
         else:
             self.state = 'WALL_END'             # wall ended: arc around the end of it
+            self.end_turned = 0.0
+            self.end_last_yaw = self.yaw
             cmd.linear.x = SPEED
             cmd.angular.z = -self.dir * SPEED / WALL_DIST
 
@@ -155,20 +178,54 @@ class RobotHandler(Node):
         else:
             cmd.angular.z = SPIN_SPEED
 
+    def cell(self, x, y):
+        return (math.floor(x / CELL), math.floor(y / CELL))
+
+    def best_direction(self):
+        """Pick the open direction (lidar) that leads to a square we have not visited yet."""
+        best_score, best_deg = -1.0, 0
+        for deg in range(0, 360, 10):
+            free = min(self.closest(deg - 10, deg + 10), 3.5)   # +-10 deg so the robot fits
+            yaw = self.yaw + math.radians(deg)
+            # look at the squares 1 m and (free - 0.5) m away in that direction
+            new = 0
+            for d in (1.0, free - 0.5):
+                if self.cell(self.x + d * math.cos(yaw), self.y + d * math.sin(yaw)) not in self.visited:
+                    new += 1
+            score = free * (1 + new)      # open and unvisited is best
+            if free > 1.0 and score > best_score:
+                best_score, best_deg = score, deg
+        return self.yaw + math.radians(best_deg)
+
     def check_loop(self):
         """If we come back to a place we visited long ago we are going around in a loop
-        (e.g. around a free-standing wall), so start following the other wall instead."""
+        (e.g. around a free-standing wall), so switch wall and drive towards somewhere new."""
         t = self.now()
         if self.history and t - self.history[-1][0] < 2.0:
             return
-        for (old_t, old_x, old_y) in self.history:
-            if t - old_t > LOOP_TIME and math.hypot(self.x - old_x, self.y - old_y) < LOOP_DIST:
-                self.dir = -self.dir
-                self.state = 'FIND'       # drive straight until we hit a new wall
-                self.history = []
-                self.get_logger().info('Driving in a loop, switching to the other wall')
-                return
+        if self.cell(self.x, self.y) not in self.visited:
+            self.visited.add(self.cell(self.x, self.y))
+            self.last_new = t
+        looping = any(t - old_t > LOOP_TIME and math.hypot(self.x - old_x, self.y - old_y) < LOOP_DIST
+                      for (old_t, old_x, old_y) in self.history)
+        if looping or t - self.last_new > NO_NEW_TIME:
+            self.dir = -self.dir
+            self.escape_yaw = self.best_direction()
+            self.state = 'ESCAPE'         # turn towards somewhere new, then drive straight (FIND)
+            self.history = []
+            self.last_new = t
+            reason = 'Driving in a loop' if looping else 'Nothing new for a while'
+            self.get_logger().info(f'{reason}, switching wall and going somewhere new')
+            return
         self.history.append((t, self.x, self.y))
+
+    def escape(self, cmd):
+        err = self.escape_yaw - self.yaw
+        err = math.atan2(math.sin(err), math.cos(err))
+        if abs(err) < 0.15:
+            self.state = 'FIND'
+        else:
+            cmd.angular.z = TURN_SPEED if err > 0 else -TURN_SPEED
 
     def loop(self):
         if self.ranges is None:
@@ -180,6 +237,8 @@ class RobotHandler(Node):
             pass
         elif self.state == 'SPIN':
             self.spin(cmd)
+        elif self.state == 'ESCAPE':
+            self.escape(cmd)
         elif self.state == 'FOLLOW' and self.now() - self.last_spin > SPIN_EVERY:
             self.state = 'SPIN'
             self.spun = 0.0
@@ -188,7 +247,8 @@ class RobotHandler(Node):
             if self.state in ('TO_FIRE', 'AT_FIRE'):
                 self.state = 'FOLLOW'
             self.check_loop()
-            self.follow_wall(cmd)
+            if self.state != 'ESCAPE':    # check_loop may have started an escape
+                self.follow_wall(cmd)
 
         self.get_logger().info(f'{self.state}', throttle_duration_sec=2.0)
         self.pub.publish(cmd)
