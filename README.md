@@ -6,12 +6,6 @@ colcon build
 source install/setup.bash
 ```
 
-Hvis Gazebo ikke finner modellene:
-
-```
-export GAZEBO_MODEL_PATH=~/ros2_ws/src/multi_robot_challenge_23/models:$GAZEBO_MODEL_PATH
-```
-
 ## Kjøre
 
 Tre terminaler (husk å source i hver av dem):
