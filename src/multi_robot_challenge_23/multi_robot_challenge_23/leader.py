@@ -1,7 +1,6 @@
 import math
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import SingleThreadedExecutor
 from geometry_msgs.msg import Pose, Point
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Int64, Bool
@@ -10,16 +9,13 @@ from scoring_interfaces.srv import SetMarkerPosition
 ROBOTS = ['tb3_0', 'tb3_1']
 BIG_FIRE_ID = 4
 MEET_DIST = 1.8        # both robots closer than this to the big fire -> bonus (scoring uses 2 m)
-FIRE_TIMEOUT = 240.0   # never wait at the fire longer than this
-NO_PROGRESS = 90.0     # stop waiting if the other robot has not come closer to the fire in this time
+FIRE_TIMEOUT = 300.0   # never wait at the fire longer than this
 ANSWER_TIMEOUT = 3.0   # no answer from the scoring node after this -> send the report again
-SERVICE_TIMEOUT = 10.0 # scoring service not found for this long -> make a new client node
 
 
 class Leader(Node):
-    def __init__(self, executor):
+    def __init__(self):
         super().__init__('leader')
-        self.executor_ref = executor
         self.last_pose = {}                      # latest marker pose seen by each robot
         self.robot_pos = {}                      # latest odom position of each robot
         self.reported = set()                    # marker ids accepted by the scoring node
@@ -27,9 +23,6 @@ class Leader(Node):
         self.busy_since = 0.0
         self.fire = None                         # position of the big fire once accepted
         self.fire_time = 0.0
-        self.fire_finder = None                  # robot that found the big fire
-        self.best_dist = None                    # closest the other robot has been to the fire
-        self.progress_time = 0.0                 # when the other robot last came closer
         self.fire_done = False
 
         for ns in ROBOTS:
@@ -43,27 +36,11 @@ class Leader(Node):
 
         self.fire_pub = self.create_publisher(Point, '/big_fire', 10)
         self.done_pub = self.create_publisher(Bool, '/fire_done', 10)
-        self.reporter = None
-        self.reporter_count = 0
-        self.new_reporter()
+        self.client = self.create_client(SetMarkerPosition, '/set_marker_position')
         self.create_timer(1.0, self.loop)
 
     def now(self):
         return self.get_clock().now().nanoseconds / 1e9
-
-    def new_reporter(self):
-        """The scoring client is in its own small node. In ROS 2 Foxy every node is its own DDS
-        participant, and in our tests a participant sometimes never found the scoring service.
-        A new node does the discovery again, which fixed it."""
-        if self.reporter is not None:
-            self.get_logger().warn('Making a new node for the scoring client')
-            self.executor_ref.remove_node(self.reporter)
-            self.reporter.destroy_node()
-        self.reporter_count += 1
-        self.reporter = Node(f'leader_reporter_{self.reporter_count}')
-        self.client = self.reporter.create_client(SetMarkerPosition, '/set_marker_position')
-        self.executor_ref.add_node(self.reporter)
-        self.client_time = self.now()
 
     def pose_cb(self, msg, ns):
         self.last_pose[ns] = msg
@@ -80,13 +57,10 @@ class Leader(Node):
             # The answer got lost (happens sometimes with ROS 2 Foxy services), so send it again
             self.get_logger().warn('No answer from the scoring node, sending again')
             self.busy = False
-            self.new_reporter()
         if marker_id in self.reported or self.busy or ns not in self.last_pose:
             return
         if not self.client.service_is_ready():
             self.get_logger().warn('Scoring service not available', throttle_duration_sec=5.0)
-            if self.now() - self.client_time > SERVICE_TIMEOUT:
-                self.new_reporter()
             return
 
         req = SetMarkerPosition.Request()
@@ -108,8 +82,6 @@ class Leader(Node):
             if req.marker_id == BIG_FIRE_ID:
                 self.fire = Point(x=p.x, y=p.y, z=0.0)
                 self.fire_time = self.now()
-                self.fire_finder = ns
-                self.progress_time = self.now()
         else:
             # Probably a bad pose estimate, we just try again with the next detection
             self.get_logger().info(f'Marker {req.marker_id} not accepted, trying again later')
@@ -124,16 +96,8 @@ class Leader(Node):
             dist = {ns: math.hypot(pos.x - self.fire.x, pos.y - self.fire.y)
                     for ns, pos in self.robot_pos.items()}
             close = sum(d < MEET_DIST for d in dist.values())
-            # Is the other robot getting closer to the fire? (0.5 m better than before counts)
-            for ns, d in dist.items():
-                if ns != self.fire_finder and (self.best_dist is None or d < self.best_dist - 0.5):
-                    self.best_dist = d
-                    self.progress_time = self.now()
             if close >= len(ROBOTS):
                 self.get_logger().info('Both robots are at the big fire!')
-                self.fire_done = True
-            elif self.now() - self.progress_time > NO_PROGRESS:
-                self.get_logger().info('The other robot is not coming closer, continue exploring')
                 self.fire_done = True
             elif self.now() - self.fire_time > FIRE_TIMEOUT:
                 self.get_logger().info('Waited too long at the big fire, continue exploring')
@@ -143,11 +107,9 @@ class Leader(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    executor = SingleThreadedExecutor()
-    node = Leader(executor)
-    executor.add_node(node)
+    node = Leader()
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     node.destroy_node()
